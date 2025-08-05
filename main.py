@@ -5,56 +5,56 @@ from binance.client import Client
 from binance.enums import *
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 
-# Load environment variables
 load_dotenv()
 
-# === BINANCE CONFIGURATION ===
+# === SCALPING CONFIGURATION ===
 SYMBOL = "XRPUSDT"
-TAKER_FEE = 0.0004      # 0.04% futures taker
-MAKER_FEE = 0.0002      # 0.02% futures maker
-MAKER_FILL_RATIO = 0.30
-BLENDED_FEE = 0.00026   # Blended fee rate
-SLIPPAGE = 0.0002
-TOTAL_COST = 0.00046    # Total trading cost
+TIMEFRAME = "3m"  # 3-minute scalping
+TAKER_FEE = 0.0004
+MAKER_FEE = 0.0002
+TOTAL_COST = 0.00046
 
-# Position sizing
-MIN_POSITION = 1500
-MAX_POSITION = 5000
-MAX_ACCOUNT_RISK = 0.15
-EMERGENCY_STOP = 0.015
+# Scalping parameters
+MIN_POSITION = 500   # Smaller positions for scalping
+MAX_POSITION = 2000
+SCALP_PROFIT_TARGET = 0.008  # 0.8% profit target
+SCALP_STOP_LOSS = 0.004      # 0.4% stop loss
+QUICK_EXIT_TIME = 300        # 5 minutes max hold
 
-# ADX thresholds
-ADX_TREND_MIN = 20
-ADX_STRONG = 25
-ADX_EXTREME = 40
+# Indicator settings
+RSI_PERIOD = 14
+RSI_OVERSOLD = 25
+RSI_OVERBOUGHT = 75
+MFI_PERIOD = 14
+MFI_OVERSOLD = 20
+MFI_OVERBOUGHT = 80
+HHLL_LOOKBACK = 10
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class StreamlinedTradingBot:
+class ScalpingBot:
     def __init__(self):
         self.client = Client(
             api_key=os.getenv('BINANCE_API_KEY'),
             api_secret=os.getenv('BINANCE_API_SECRET'),
-            testnet=True,  # Using Binance testnet
-            tld='com'  # Ensure correct TLD
+            testnet=True
         )
-        # Set testnet base URL
-        self.client.API_URL = 'https://testnet.binancefuture.com'
-        
-        self.position_size = 0
-        self.entry_price = 0
         self.in_position = False
+        self.position_side = None
+        self.entry_price = 0
+        self.entry_time = None
+        self.position_qty = 0
         
-    def get_klines(self, interval="15m", limit=100):
-        """Fetch kline data for XRPUSDT"""
+    def get_klines(self, limit=100):
+        """Get 3-minute klines"""
         try:
             klines = self.client.futures_klines(
                 symbol=SYMBOL,
-                interval=interval,
+                interval=TIMEFRAME,
                 limit=limit
             )
             
@@ -64,230 +64,217 @@ class StreamlinedTradingBot:
                 'taker_buy_quote', 'ignore'
             ])
             
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype({
-                'open': float, 'high': float, 'low': float, 'close': float, 'volume': float
-            })
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume']
+            df[numeric_cols] = df[numeric_cols].astype(float)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             
             return df.sort_values('timestamp')
         except Exception as e:
             logger.error(f"Error fetching klines: {e}")
             return None
 
-    def calculate_atr(self, df, period=14):
-        """Calculate Average True Range"""
-        high = df['high']
-        low = df['low'] 
-        close = df['close']
-        
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(window=period).mean().iloc[-1]
-        return atr
+    def calculate_rsi(self, prices, period=RSI_PERIOD):
+        """Calculate RSI"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
-    def calculate_adx(self, df, period=14):
-        """Calculate ADX for trend strength"""
-        high = df['high']
-        low = df['low']
-        close = df['close']
+    def calculate_mfi(self, df, period=MFI_PERIOD):
+        """Calculate Money Flow Index"""
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        money_flow = typical_price * df['volume']
         
-        # Calculate +DI and -DI
-        up = high.diff()
-        down = -low.diff()
+        # Positive and negative money flow
+        positive_mf = money_flow.where(typical_price > typical_price.shift(1), 0)
+        negative_mf = money_flow.where(typical_price < typical_price.shift(1), 0)
         
-        plus_dm = np.where((up > down) & (up > 0), up, 0)
-        minus_dm = np.where((down > up) & (down > 0), down, 0)
+        # Money flow ratio
+        positive_mf_sum = positive_mf.rolling(window=period).sum()
+        negative_mf_sum = negative_mf.rolling(window=period).sum()
         
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([pd.Series(tr1), pd.Series(tr2), pd.Series(tr3)], axis=1).max(axis=1)
+        mfr = positive_mf_sum / negative_mf_sum
+        mfi = 100 - (100 / (1 + mfr))
         
-        atr = tr.rolling(window=period).mean()
-        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr)
-        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr)
-        
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.rolling(window=period).mean().iloc[-1]
-        
-        return adx if not pd.isna(adx) else 0
+        return mfi
 
-    def calculate_position_size(self, account_balance, confidence_score):
-        """Dynamic position sizing based on confidence"""
-        base_size = MIN_POSITION
+    def detect_hhll(self, df, lookback=HHLL_LOOKBACK):
+        """Detect Higher Highs/Lower Lows pattern"""
+        highs = df['high'].rolling(window=lookback).max()
+        lows = df['low'].rolling(window=lookback).min()
         
-        # Adjust based on confidence (0.8x to 1.5x multiplier)
-        confidence_multiplier = 0.8 + (confidence_score * 0.7)
-        adjusted_size = base_size * confidence_multiplier
+        current_high = df['high'].iloc[-1]
+        current_low = df['low'].iloc[-1]
+        prev_high = highs.iloc[-2]
+        prev_low = lows.iloc[-2]
         
-        # Cap at max position and account risk
-        max_allowed = account_balance * MAX_ACCOUNT_RISK
-        position_size = min(adjusted_size, MAX_POSITION, max_allowed)
+        # Higher High + Higher Low = Uptrend
+        higher_high = current_high > prev_high
+        higher_low = current_low > prev_low
+        uptrend = higher_high and higher_low
         
-        return position_size
+        # Lower High + Lower Low = Downtrend
+        lower_high = current_high < prev_high
+        lower_low = current_low < prev_low
+        downtrend = lower_high and lower_low
+        
+        return {
+            'uptrend': uptrend,
+            'downtrend': downtrend,
+            'higher_high': higher_high,
+            'lower_low': lower_low
+        }
 
-    def calculate_break_even(self, position_size):
-        """Calculate break-even PnL and minimum profit target"""
-        break_even_pnl = position_size * TOTAL_COST
-        min_profit_target = break_even_pnl + 15.0
-        return break_even_pnl, min_profit_target
-
-    def generate_signal(self, df):
-        """Simple trend following signal based on moving averages and ADX"""
-        if len(df) < 50:
+    def generate_scalping_signal(self, df):
+        """Generate scalping signals using RSI + MFI + HHLL"""
+        if len(df) < max(RSI_PERIOD, MFI_PERIOD, HHLL_LOOKBACK) + 5:
             return None, 0
             
         # Calculate indicators
-        close = df['close']
-        ma_fast = close.rolling(window=10).mean().iloc[-1]
-        ma_slow = close.rolling(window=20).mean().iloc[-1]
-        current_price = close.iloc[-1]
+        rsi = self.calculate_rsi(df['close'])
+        mfi = self.calculate_mfi(df)
+        hhll = self.detect_hhll(df)
         
-        adx = self.calculate_adx(df)
+        current_rsi = rsi.iloc[-1]
+        current_mfi = mfi.iloc[-1]
         
-        # Signal generation
+        if pd.isna(current_rsi) or pd.isna(current_mfi):
+            return None, 0
+        
         signal = None
         confidence = 0
         
-        if adx > ADX_TREND_MIN:
-            if ma_fast > ma_slow and current_price > ma_fast:
-                signal = "LONG"
-                confidence = min(0.9, adx / 50)
-            elif ma_fast < ma_slow and current_price < ma_fast:
-                signal = "SHORT" 
-                confidence = min(0.9, adx / 50)
-                
+        # LONG Signal: RSI oversold + MFI oversold + Uptrend confirmation
+        if (current_rsi < RSI_OVERSOLD and 
+            current_mfi < MFI_OVERSOLD and 
+            hhll['uptrend']):
+            
+            signal = "LONG"
+            # Confidence based on how oversold and trend strength
+            rsi_strength = (RSI_OVERSOLD - current_rsi) / RSI_OVERSOLD
+            mfi_strength = (MFI_OVERSOLD - current_mfi) / MFI_OVERSOLD
+            confidence = min(0.95, (rsi_strength + mfi_strength) / 2 + 0.3)
+            
+        # SHORT Signal: RSI overbought + MFI overbought + Downtrend confirmation
+        elif (current_rsi > RSI_OVERBOUGHT and 
+              current_mfi > MFI_OVERBOUGHT and 
+              hhll['downtrend']):
+            
+            signal = "SHORT"
+            rsi_strength = (current_rsi - RSI_OVERBOUGHT) / (100 - RSI_OVERBOUGHT)
+            mfi_strength = (current_mfi - MFI_OVERBOUGHT) / (100 - MFI_OVERBOUGHT)
+            confidence = min(0.95, (rsi_strength + mfi_strength) / 2 + 0.3)
+        
         return signal, confidence
 
-    def place_limit_order(self, side, qty, price):
-        """Place limit order (IOC equivalent)"""
-        try:
-            if side == "BUY":
-                order = self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=SIDE_BUY,
-                    type=ORDER_TYPE_LIMIT,
-                    timeInForce=TIME_IN_FORCE_IOC,
-                    quantity=qty,
-                    price=str(price)
-                )
-            else:
-                order = self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=SIDE_SELL,
-                    type=ORDER_TYPE_LIMIT,
-                    timeInForce=TIME_IN_FORCE_IOC,
-                    quantity=qty,
-                    price=str(price)
-                )
-            return order
-        except Exception as e:
-            logger.error(f"Limit order error: {e}")
-            return None
-
-    def place_market_order(self, side, qty):
-        """Fallback market order"""
-        try:
-            if side == "BUY":
-                order = self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=SIDE_BUY,
-                    type=ORDER_TYPE_MARKET,
-                    quantity=qty
-                )
-            else:
-                order = self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=SIDE_SELL,
-                    type=ORDER_TYPE_MARKET,
-                    quantity=qty
-                )
-            return order
-        except Exception as e:
-            logger.error(f"Market order error: {e}")
-            return None
-
-    def execute_trade(self, signal, position_size, current_price, confidence):
-        """Limit-first execution strategy"""
-        # Convert position size to quantity (USDT to XRP)
-        qty = round(position_size / current_price, 1)
-        
-        if signal == "LONG":
-            side = "BUY"
-            # Try limit order first
-            limit_offset = 0.0003 if confidence > 0.85 else 0.0006
-            limit_price = round(current_price * (1 - limit_offset), 4)
-            
-            result = self.place_limit_order(side, qty, limit_price)
-            
-            # If limit fails, use market order
-            if not result:
-                result = self.place_market_order(side, qty)
-                
-        elif signal == "SHORT":
-            side = "SELL"
-            limit_offset = 0.0003 if confidence > 0.85 else 0.0006
-            limit_price = round(current_price * (1 + limit_offset), 4)
-            
-            result = self.place_limit_order(side, qty, limit_price)
-            
-            if not result:
-                result = self.place_market_order(side, qty)
-        
-        return result
-
-    def check_exit_conditions(self, current_price, atr):
-        """Check if position should be closed"""
+    def check_scalping_exit(self, current_price):
+        """Check scalping exit conditions"""
         if not self.in_position:
-            return False
+            return False, "No position"
             
+        # Time-based exit (5 minutes max)
+        if self.entry_time:
+            time_diff = (datetime.now() - self.entry_time).seconds
+            if time_diff > QUICK_EXIT_TIME:
+                return True, "Time exit"
+        
         # Calculate PnL
-        if self.position_size > 0:  # Long position
+        if self.position_side == "LONG":
             pnl_pct = (current_price - self.entry_price) / self.entry_price
-        else:  # Short position
+        else:  # SHORT
             pnl_pct = (self.entry_price - current_price) / self.entry_price
             
-        # Emergency stop
-        if pnl_pct <= -EMERGENCY_STOP:
-            logger.info(f"Emergency stop triggered: {pnl_pct:.4f}")
-            return True
+        # Profit target
+        if pnl_pct >= SCALP_PROFIT_TARGET:
+            return True, f"Profit target hit: {pnl_pct:.3f}"
             
-        # Trailing stop based on ATR
-        if pnl_pct > 0.01:  # Only trail if in profit
-            trailing_distance = atr * 2
-            if self.position_size > 0:  # Long
-                stop_price = current_price - trailing_distance
-                if current_price <= stop_price:
-                    return True
-            else:  # Short
-                stop_price = current_price + trailing_distance
-                if current_price >= stop_price:
-                    return True
-                    
-        return False
+        # Stop loss
+        if pnl_pct <= -SCALP_STOP_LOSS:
+            return True, f"Stop loss hit: {pnl_pct:.3f}"
+            
+        return False, "Hold"
 
-    def get_account_balance(self):
-        """Get futures account balance"""
+    def calculate_scalp_position_size(self, confidence):
+        """Calculate position size for scalping"""
         try:
             account = self.client.futures_account()
             balance = float(account['totalWalletBalance'])
-            return balance
         except:
-            return 10000  # Default for testing
+            balance = 10000
+            
+        # Smaller base size for scalping
+        base_size = MIN_POSITION * confidence
+        max_allowed = balance * 0.1  # 10% max for scalping
+        
+        return min(base_size, MAX_POSITION, max_allowed)
 
-    def close_position(self):
-        """Close current position"""
+    def execute_scalp_order(self, signal, position_size, current_price):
+        """Execute scalping order with tight spreads"""
+        qty = round(position_size / current_price, 1)
+        
         try:
-            # Get current position
+            if signal == "LONG":
+                # Try limit order very close to market
+                limit_price = round(current_price * 0.9998, 4)  # 0.02% below market
+                
+                order = self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=SIDE_BUY,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_IOC,
+                    quantity=qty,
+                    price=str(limit_price)
+                )
+                
+                # Fallback to market if limit fails
+                if not order:
+                    order = self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=SIDE_BUY,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=qty
+                    )
+                    
+            else:  # SHORT
+                limit_price = round(current_price * 1.0002, 4)  # 0.02% above market
+                
+                order = self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=SIDE_SELL,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_IOC,
+                    quantity=qty,
+                    price=str(limit_price)
+                )
+                
+                if not order:
+                    order = self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=SIDE_SELL,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=qty
+                    )
+            
+            return order
+            
+        except Exception as e:
+            logger.error(f"Order execution error: {e}")
+            return None
+
+    def close_scalp_position(self):
+        """Close scalping position quickly"""
+        try:
             positions = self.client.futures_position_information(symbol=SYMBOL)
             
             for pos in positions:
-                if float(pos['positionAmt']) != 0:
-                    qty = abs(float(pos['positionAmt']))
-                    side = SIDE_SELL if float(pos['positionAmt']) > 0 else SIDE_BUY
+                pos_amt = float(pos['positionAmt'])
+                if pos_amt != 0:
+                    qty = abs(pos_amt)
+                    side = SIDE_SELL if pos_amt > 0 else SIDE_BUY
                     
+                    # Market order for quick exit
                     order = self.client.futures_create_order(
                         symbol=SYMBOL,
                         side=side,
@@ -297,63 +284,82 @@ class StreamlinedTradingBot:
                     
                     if order:
                         self.in_position = False
-                        self.position_size = 0
-                        logger.info("Position closed successfully")
+                        self.position_side = None
+                        self.entry_price = 0
+                        self.entry_time = None
                         return True
+                        
             return False
         except Exception as e:
             logger.error(f"Error closing position: {e}")
             return False
 
-    async def run_trading_loop(self):
-        """Main trading loop"""
-        logger.info(f"Starting streamlined Binance trading bot for {SYMBOL}")
+    async def run_scalping_loop(self):
+        """Main 3-minute scalping loop"""
+        logger.info(f"🚀 Starting 3-minute RSI+MFI+HHLL scalping bot for {SYMBOL}")
+        logger.info(f"📊 Timeframe: {TIMEFRAME}")
+        logger.info(f"💰 Position range: ${MIN_POSITION}-${MAX_POSITION}")
+        logger.info(f"🎯 Profit target: {SCALP_PROFIT_TARGET*100:.1f}% | Stop loss: {SCALP_STOP_LOSS*100:.1f}%")
         
         while True:
             try:
-                # Get market data
-                df = self.get_klines()
+                # Get fresh market data
+                df = self.get_klines(limit=50)
                 if df is None:
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(10)
                     continue
                     
                 current_price = df['close'].iloc[-1]
-                atr = self.calculate_atr(df)
                 
                 # Check exit conditions first
-                if self.check_exit_conditions(current_price, atr):
-                    self.close_position()
+                if self.in_position:
+                    should_exit, reason = self.check_scalping_exit(current_price)
+                    if should_exit:
+                        if self.close_scalp_position():
+                            logger.info(f"🔄 Position closed: {reason}")
+                        else:
+                            logger.error("❌ Failed to close position")
                 
-                # Generate new signals if not in position
+                # Look for new scalping opportunities
                 if not self.in_position:
-                    signal, confidence = self.generate_signal(df)
+                    signal, confidence = self.generate_scalping_signal(df)
                     
-                    if signal and confidence > 0.7:  # Minimum confidence threshold
-                        account_balance = self.get_account_balance()
-                        position_size = self.calculate_position_size(account_balance, confidence)
+                    if signal and confidence > 0.6:  # Lower threshold for scalping
+                        position_size = self.calculate_scalp_position_size(confidence)
                         
-                        # Validate fee efficiency
-                        break_even_pnl, min_profit = self.calculate_break_even(position_size)
-                        fee_pct = (break_even_pnl / position_size) * 100
+                        # Execute scalping trade
+                        order = self.execute_scalp_order(signal, position_size, current_price)
                         
-                        if fee_pct <= 3.0:  # Fee efficiency check
-                            result = self.execute_trade(signal, position_size, current_price, confidence)
+                        if order:
+                            self.in_position = True
+                            self.position_side = signal
+                            self.entry_price = current_price
+                            self.entry_time = datetime.now()
+                            self.position_qty = position_size / current_price
                             
-                            if result:
-                                self.in_position = True
-                                self.entry_price = current_price
-                                self.position_size = position_size if signal == "LONG" else -position_size
-                                
-                                logger.info(f"Trade executed: {signal} ${position_size} @ {current_price:.4f}")
-                                logger.info(f"Break-even PnL: ${break_even_pnl:.2f}, Min profit: ${min_profit:.2f}")
+                            # Calculate targets
+                            if signal == "LONG":
+                                target_price = current_price * (1 + SCALP_PROFIT_TARGET)
+                                stop_price = current_price * (1 - SCALP_STOP_LOSS)
+                            else:
+                                target_price = current_price * (1 - SCALP_PROFIT_TARGET)
+                                stop_price = current_price * (1 + SCALP_STOP_LOSS)
+                            
+                            logger.info(f"📈 {signal} scalp executed:")
+                            logger.info(f"   Entry: ${current_price:.4f}")
+                            logger.info(f"   Size: ${position_size:.0f}")
+                            logger.info(f"   Target: ${target_price:.4f}")
+                            logger.info(f"   Stop: ${stop_price:.4f}")
+                            logger.info(f"   Confidence: {confidence:.2f}")
                 
-                await asyncio.sleep(15)  # 15-second cycle
+                # Short cycle for scalping
+                await asyncio.sleep(5)
                 
             except Exception as e:
-                logger.error(f"Trading loop error: {e}")
-                await asyncio.sleep(30)
+                logger.error(f"Scalping loop error: {e}")
+                await asyncio.sleep(15)
 
 # === STARTUP ===
 if __name__ == "__main__":
-    bot = StreamlinedTradingBot()
-    asyncio.run(bot.run_trading_loop())
+    bot = ScalpingBot()
+    asyncio.run(bot.run_scalping_loop())

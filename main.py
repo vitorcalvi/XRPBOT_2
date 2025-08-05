@@ -7,8 +7,112 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
+import requests
 
 load_dotenv()
+
+# === TELEGRAM NOTIFIER CLASS ===
+class TelegramNotifier:
+    """Streamlined Telegram notifications for scalping bot"""
+    
+    def __init__(self):
+        self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.symbol = "XRPUSDT"
+        self.enabled = bool(self.bot_token and self.chat_id)
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+    
+    async def send_message(self, message: str) -> bool:
+        """Send message to Telegram"""
+        if not self.enabled:
+            return False
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/sendMessage",
+                json={
+                    'chat_id': self.chat_id,
+                    'text': message,
+                    'parse_mode': 'HTML',
+                    'disable_web_page_preview': True
+                },
+                timeout=10
+            )
+            return response.status_code == 200
+        except:
+            return False
+    
+    async def send_scalp_entry(self, signal, price, position_size, confidence, rsi, mfi):
+        """Send scalping entry notification"""
+        emoji = "🟢 LONG" if signal == "LONG" else "🔴 SHORT"
+        
+        message = f"""⚡ <b>SCALP ENTRY</b> {emoji}
+
+<b>Symbol:</b> {self.symbol}
+<b>Price:</b> ${price:.4f}
+<b>Size:</b> ${position_size:.0f}
+<b>Confidence:</b> {confidence:.0%}
+
+<b>Indicators:</b>
+RSI: {rsi:.1f} | MFI: {mfi:.1f}
+HHLL: {'Uptrend' if signal == 'LONG' else 'Downtrend'}
+
+<b>Targets:</b>
+Profit: {price * (1.008 if signal == 'LONG' else 0.992):.4f} (0.8%)
+Stop: {price * (0.996 if signal == 'LONG' else 1.004):.4f} (0.4%)
+
+🕒 {datetime.now().strftime('%H:%M:%S')}"""
+        
+        await self.send_message(message)
+    
+    async def send_scalp_exit(self, signal, exit_price, pnl_pct, reason, duration_seconds):
+        """Send scalping exit notification"""
+        emoji = "🟢 WIN" if pnl_pct >= 0 else "🔴 LOSS"
+        pnl_text = f"+{pnl_pct:.2%}" if pnl_pct >= 0 else f"{pnl_pct:.2%}"
+        duration_text = self._format_duration(duration_seconds)
+        
+        message = f"""⚡ <b>SCALP EXIT</b> {emoji}
+
+<b>Symbol:</b> {self.symbol}
+<b>Price:</b> ${exit_price:.4f}
+<b>PnL:</b> {pnl_text}
+<b>Duration:</b> {duration_text}
+<b>Reason:</b> {reason}
+
+🕒 {datetime.now().strftime('%H:%M:%S')}"""
+        
+        await self.send_message(message)
+    
+    def _format_duration(self, duration_seconds):
+        """Format duration"""
+        if duration_seconds < 60:
+            return f"{duration_seconds:.0f}s"
+        elif duration_seconds < 3600:
+            return f"{duration_seconds / 60:.1f}m"
+        else:
+            return f"{duration_seconds / 3600:.1f}h"
+    
+    async def send_bot_status(self, status: str, message_text: str = ""):
+        """Send bot status"""
+        headlines = {
+            'started': '🚀 SCALPING BOT STARTED',
+            'stopped': '🛑 SCALPING BOT STOPPED',
+            'error': '❌ SCALPING ERROR'
+        }
+        
+        headline = headlines.get(status.lower(), '📊 SCALPING STATUS')
+        info_line = f"\n<b>Info:</b> {message_text}" if message_text else ""
+        
+        message = f"""<b>{headline}</b>
+
+<b>Symbol:</b> {self.symbol}
+<b>Strategy:</b> 3m RSI+MFI+HHLL Scalping
+<b>Timeframe:</b> 3-minute
+<b>Targets:</b> 0.8% profit | 0.4% stop{info_line}
+
+🕒 {datetime.now().strftime('%H:%M:%S')}"""
+        
+        await self.send_message(message)
 
 # === SCALPING CONFIGURATION ===
 SYMBOL = "XRPUSDT"
@@ -43,6 +147,7 @@ class ScalpingBot:
             api_secret=os.getenv('BINANCE_API_SECRET'),
             testnet=True
         )
+        self.telegram = TelegramNotifier()
         self.in_position = False
         self.position_side = None
         self.entry_price = 0
@@ -107,23 +212,25 @@ class ScalpingBot:
         
         current_high = df['high'].iloc[-1]
         current_low = df['low'].iloc[-1]
-        prev_high = highs.iloc[-2]
-        prev_low = lows.iloc[-2]
+        prev_high = highs.iloc[-2] if len(highs) > 1 else current_high
+        prev_low = lows.iloc[-2] if len(lows) > 1 else current_low
         
-        # Higher High + Higher Low = Uptrend
+        # Pattern detection
         higher_high = current_high > prev_high
         higher_low = current_low > prev_low
-        uptrend = higher_high and higher_low
-        
-        # Lower High + Lower Low = Downtrend
         lower_high = current_high < prev_high
         lower_low = current_low < prev_low
+        
+        # Trend confirmation
+        uptrend = higher_high and higher_low
         downtrend = lower_high and lower_low
         
         return {
             'uptrend': uptrend,
             'downtrend': downtrend,
             'higher_high': higher_high,
+            'higher_low': higher_low,
+            'lower_high': lower_high,
             'lower_low': lower_low
         }
 
@@ -169,8 +276,8 @@ class ScalpingBot:
         
         return signal, confidence
 
-    def check_scalping_exit(self, current_price):
-        """Check scalping exit conditions"""
+    def check_scalping_exit(self, df, current_price):
+        """Check scalping exit conditions including HHLL pattern reversal"""
         if not self.in_position:
             return False, "No position"
             
@@ -194,6 +301,20 @@ class ScalpingBot:
         if pnl_pct <= -SCALP_STOP_LOSS:
             return True, f"Stop loss hit: {pnl_pct:.3f}"
             
+        # HHLL Pattern Reversal Exit (KEY FEATURE)
+        if len(df) >= HHLL_LOOKBACK + 5:
+            hhll = self.detect_hhll(df)
+            
+            # Exit LONG position if uptrend breaks (Lower High or Lower Low detected)
+            if self.position_side == "LONG":
+                if hhll['downtrend'] or (not hhll['higher_high'] and not hhll['higher_low']):
+                    return True, f"HHLL uptrend reversal: {pnl_pct:.3f}"
+                    
+            # Exit SHORT position if downtrend breaks (Higher High or Higher Low detected)  
+            elif self.position_side == "SHORT":
+                if hhll['uptrend'] or (not hhll['lower_high'] and not hhll['lower_low']):
+                    return True, f"HHLL downtrend reversal: {pnl_pct:.3f}"
+        
         return False, "Hold"
 
     def calculate_scalp_position_size(self, confidence):
@@ -313,10 +434,23 @@ class ScalpingBot:
                 
                 # Check exit conditions first
                 if self.in_position:
-                    should_exit, reason = self.check_scalping_exit(current_price)
+                    should_exit, reason = self.check_scalping_exit(df, current_price)
                     if should_exit:
                         if self.close_scalp_position():
+                            # Calculate PnL and duration for notification
+                            if self.position_side == "LONG":
+                                pnl_pct = (current_price - self.entry_price) / self.entry_price
+                            else:
+                                pnl_pct = (self.entry_price - current_price) / self.entry_price
+                            
+                            duration = (datetime.now() - self.entry_time).total_seconds() if self.entry_time else 0
+                            
                             logger.info(f"🔄 Position closed: {reason}")
+                            
+                            # Send Telegram exit notification
+                            await self.telegram.send_scalp_exit(
+                                self.position_side, current_price, pnl_pct, reason, duration
+                            )
                         else:
                             logger.error("❌ Failed to close position")
                 
@@ -345,12 +479,21 @@ class ScalpingBot:
                                 target_price = current_price * (1 - SCALP_PROFIT_TARGET)
                                 stop_price = current_price * (1 + SCALP_STOP_LOSS)
                             
+                            # Get current indicators for notification
+                            rsi = self.calculate_rsi(df['close']).iloc[-1]
+                            mfi = self.calculate_mfi(df).iloc[-1]
+                            
                             logger.info(f"📈 {signal} scalp executed:")
                             logger.info(f"   Entry: ${current_price:.4f}")
                             logger.info(f"   Size: ${position_size:.0f}")
                             logger.info(f"   Target: ${target_price:.4f}")
                             logger.info(f"   Stop: ${stop_price:.4f}")
                             logger.info(f"   Confidence: {confidence:.2f}")
+                            
+                            # Send Telegram notification
+                            await self.telegram.send_scalp_entry(
+                                signal, current_price, position_size, confidence, rsi, mfi
+                            )
                 
                 # Short cycle for scalping
                 await asyncio.sleep(5)

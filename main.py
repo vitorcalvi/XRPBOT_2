@@ -1,19 +1,24 @@
 import asyncio
 import os
-from pybit.unified_trading import HTTP
+from dotenv import load_dotenv
+from binance.client import Client
+from binance.enums import *
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import logging
 
-# === CORE CONFIGURATION ===
+# Load environment variables
+load_dotenv()
+
+# === BINANCE CONFIGURATION ===
 SYMBOL = "XRPUSDT"
-TAKER_FEE = 0.00055
-MAKER_FEE = 0.0001
+TAKER_FEE = 0.0004      # 0.04% futures taker
+MAKER_FEE = 0.0002      # 0.02% futures maker
 MAKER_FILL_RATIO = 0.30
-BLENDED_FEE = 0.000415
+BLENDED_FEE = 0.00026   # Blended fee rate
 SLIPPAGE = 0.0002
-TOTAL_COST = 0.000615
+TOTAL_COST = 0.00046    # Total trading cost
 
 # Position sizing
 MIN_POSITION = 1500
@@ -31,30 +36,39 @@ logger = logging.getLogger(__name__)
 
 class StreamlinedTradingBot:
     def __init__(self):
-        self.session = HTTP(
-            testnet=True,  # Set to False for live trading
-            api_key=os.getenv('BYBIT_API_KEY'),
-            api_secret=os.getenv('BYBIT_API_SECRET')
+        self.client = Client(
+            api_key=os.getenv('BINANCE_API_KEY'),
+            api_secret=os.getenv('BINANCE_API_SECRET'),
+            testnet=True,  # Using Binance testnet
+            tld='com'  # Ensure correct TLD
         )
+        # Set testnet base URL
+        self.client.API_URL = 'https://testnet.binancefuture.com'
+        
         self.position_size = 0
         self.entry_price = 0
         self.in_position = False
         
-    def get_klines(self, interval="15", limit=100):
+    def get_klines(self, interval="15m", limit=100):
         """Fetch kline data for XRPUSDT"""
         try:
-            response = self.session.get_kline(
-                category="linear",
+            klines = self.client.futures_klines(
                 symbol=SYMBOL,
                 interval=interval,
                 limit=limit
             )
-            if response['retCode'] == 0:
-                data = response['result']['list']
-                df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
-                return df.sort_values('timestamp')
-            return None
+            
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                'taker_buy_quote', 'ignore'
+            ])
+            
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype({
+                'open': float, 'high': float, 'low': float, 'close': float, 'volume': float
+            })
+            
+            return df.sort_values('timestamp')
         except Exception as e:
             logger.error(f"Error fetching klines: {e}")
             return None
@@ -105,7 +119,7 @@ class StreamlinedTradingBot:
         base_size = MIN_POSITION
         
         # Adjust based on confidence (0.8x to 1.5x multiplier)
-        confidence_multiplier = 0.8 + (confidence_score * 0.7)  # Maps 0-1 to 0.8-1.5
+        confidence_multiplier = 0.8 + (confidence_score * 0.7)
         adjusted_size = base_size * confidence_multiplier
         
         # Cap at max position and account risk
@@ -140,7 +154,7 @@ class StreamlinedTradingBot:
         if adx > ADX_TREND_MIN:
             if ma_fast > ma_slow and current_price > ma_fast:
                 signal = "LONG"
-                confidence = min(0.9, adx / 50)  # Scale ADX to confidence
+                confidence = min(0.9, adx / 50)
             elif ma_fast < ma_slow and current_price < ma_fast:
                 signal = "SHORT" 
                 confidence = min(0.9, adx / 50)
@@ -148,18 +162,27 @@ class StreamlinedTradingBot:
         return signal, confidence
 
     def place_limit_order(self, side, qty, price):
-        """Place limit order with IOC (Immediate-or-Cancel)"""
+        """Place limit order (IOC equivalent)"""
         try:
-            response = self.session.place_order(
-                category="linear",
-                symbol=SYMBOL,
-                side=side,
-                orderType="Limit",
-                qty=str(qty),
-                price=str(price),
-                timeInForce="IOC"  # Immediate-or-Cancel for maker attempts
-            )
-            return response
+            if side == "BUY":
+                order = self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=SIDE_BUY,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_IOC,
+                    quantity=qty,
+                    price=str(price)
+                )
+            else:
+                order = self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=SIDE_SELL,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_IOC,
+                    quantity=qty,
+                    price=str(price)
+                )
+            return order
         except Exception as e:
             logger.error(f"Limit order error: {e}")
             return None
@@ -167,41 +190,51 @@ class StreamlinedTradingBot:
     def place_market_order(self, side, qty):
         """Fallback market order"""
         try:
-            response = self.session.place_order(
-                category="linear",
-                symbol=SYMBOL,
-                side=side,
-                orderType="Market",
-                qty=str(qty)
-            )
-            return response
+            if side == "BUY":
+                order = self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=SIDE_BUY,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=qty
+                )
+            else:
+                order = self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=SIDE_SELL,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=qty
+                )
+            return order
         except Exception as e:
             logger.error(f"Market order error: {e}")
             return None
 
     def execute_trade(self, signal, position_size, current_price, confidence):
         """Limit-first execution strategy"""
+        # Convert position size to quantity (USDT to XRP)
+        qty = round(position_size / current_price, 1)
+        
         if signal == "LONG":
-            side = "Buy"
+            side = "BUY"
             # Try limit order first
             limit_offset = 0.0003 if confidence > 0.85 else 0.0006
-            limit_price = current_price * (1 - limit_offset)
+            limit_price = round(current_price * (1 - limit_offset), 4)
             
-            result = self.place_limit_order(side, position_size, limit_price)
+            result = self.place_limit_order(side, qty, limit_price)
             
             # If limit fails, use market order
-            if not result or result.get('retCode') != 0:
-                result = self.place_market_order(side, position_size)
+            if not result:
+                result = self.place_market_order(side, qty)
                 
         elif signal == "SHORT":
-            side = "Sell"
+            side = "SELL"
             limit_offset = 0.0003 if confidence > 0.85 else 0.0006
-            limit_price = current_price * (1 + limit_offset)
+            limit_price = round(current_price * (1 + limit_offset), 4)
             
-            result = self.place_limit_order(side, position_size, limit_price)
+            result = self.place_limit_order(side, qty, limit_price)
             
-            if not result or result.get('retCode') != 0:
-                result = self.place_market_order(side, position_size)
+            if not result:
+                result = self.place_market_order(side, qty)
         
         return result
 
@@ -236,19 +269,45 @@ class StreamlinedTradingBot:
         return False
 
     def get_account_balance(self):
-        """Get account balance"""
+        """Get futures account balance"""
         try:
-            response = self.session.get_wallet_balance(accountType="UNIFIED")
-            if response['retCode'] == 0:
-                balance = float(response['result']['list'][0]['totalWalletBalance'])
-                return balance
-            return 10000  # Default for testing
+            account = self.client.futures_account()
+            balance = float(account['totalWalletBalance'])
+            return balance
         except:
-            return 10000
+            return 10000  # Default for testing
+
+    def close_position(self):
+        """Close current position"""
+        try:
+            # Get current position
+            positions = self.client.futures_position_information(symbol=SYMBOL)
+            
+            for pos in positions:
+                if float(pos['positionAmt']) != 0:
+                    qty = abs(float(pos['positionAmt']))
+                    side = SIDE_SELL if float(pos['positionAmt']) > 0 else SIDE_BUY
+                    
+                    order = self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=side,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=qty
+                    )
+                    
+                    if order:
+                        self.in_position = False
+                        self.position_size = 0
+                        logger.info("Position closed successfully")
+                        return True
+            return False
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
+            return False
 
     async def run_trading_loop(self):
         """Main trading loop"""
-        logger.info(f"Starting streamlined trading bot for {SYMBOL}")
+        logger.info(f"Starting streamlined Binance trading bot for {SYMBOL}")
         
         while True:
             try:
@@ -263,10 +322,7 @@ class StreamlinedTradingBot:
                 
                 # Check exit conditions first
                 if self.check_exit_conditions(current_price, atr):
-                    # Close position logic here
-                    self.in_position = False
-                    self.position_size = 0
-                    logger.info("Position closed")
+                    self.close_position()
                 
                 # Generate new signals if not in position
                 if not self.in_position:
@@ -283,12 +339,12 @@ class StreamlinedTradingBot:
                         if fee_pct <= 3.0:  # Fee efficiency check
                             result = self.execute_trade(signal, position_size, current_price, confidence)
                             
-                            if result and result.get('retCode') == 0:
+                            if result:
                                 self.in_position = True
                                 self.entry_price = current_price
                                 self.position_size = position_size if signal == "LONG" else -position_size
                                 
-                                logger.info(f"Trade executed: {signal} {position_size} @ {current_price:.4f}")
+                                logger.info(f"Trade executed: {signal} ${position_size} @ {current_price:.4f}")
                                 logger.info(f"Break-even PnL: ${break_even_pnl:.2f}, Min profit: ${min_profit:.2f}")
                 
                 await asyncio.sleep(15)  # 15-second cycle
